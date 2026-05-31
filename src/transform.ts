@@ -61,13 +61,20 @@ function imagesFromContent(content: unknown): KiroImage[] | undefined {
 
 function convertTools(tools: OpenAIChatRequest["tools"]): KiroToolSpec[] | undefined {
   if (!tools || tools.length === 0) return undefined
-  return tools.map((tool) => ({
-    toolSpecification: {
-      name: tool.function.name,
-      description: tool.function.description ?? "",
-      inputSchema: { json: tool.function.parameters ?? { type: "object", properties: {} } },
-    },
-  }))
+  const converted = tools.flatMap((tool) => {
+    const name = tool.function?.name ?? tool.name
+    if (!name) return []
+    return [
+      {
+        toolSpecification: {
+          name,
+          description: tool.function?.description ?? tool.description ?? "",
+          inputSchema: { json: tool.function?.parameters ?? tool.parameters ?? { type: "object", properties: {} } },
+        },
+      },
+    ]
+  })
+  return converted.length > 0 ? converted : undefined
 }
 
 function assistantEntry(message: OpenAIChatMessage): KiroHistoryEntry | undefined {
@@ -119,6 +126,17 @@ function isToolResultMessage(message: OpenAIChatMessage): boolean {
   return message.role === "tool" && typeof message.tool_call_id === "string"
 }
 
+function hasAssistantToolCalls(message: OpenAIChatMessage): boolean {
+  return message.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0
+}
+
+function findCurrentMessageStartIndex(messages: OpenAIChatMessage[]): number {
+  let start = messages.length - 1
+  while (start > 0 && isToolResultMessage(messages[start])) start--
+  if (start >= 0 && messages[start].role === "assistant" && !hasAssistantToolCalls(messages[start])) start++
+  return Math.max(0, start)
+}
+
 function mergeHistoryEntries(entries: KiroHistoryEntry[]): KiroHistoryEntry[] {
   const merged: KiroHistoryEntry[] = []
   for (const entry of entries) {
@@ -157,57 +175,117 @@ function mergeHistoryEntries(entries: KiroHistoryEntry[]): KiroHistoryEntry[] {
   return merged
 }
 
+function stripHistoryImages(history: KiroHistoryEntry[]): KiroHistoryEntry[] {
+  return history.map((entry) => {
+    if (!entry.userInputMessage?.images) return entry
+    const { images: _images, ...userInputMessage } = entry.userInputMessage
+    return { ...entry, userInputMessage }
+  })
+}
+
+function sanitizeHistory(history: KiroHistoryEntry[]): KiroHistoryEntry[] {
+  while (
+    history.length > 0 &&
+    (!history[0]?.userInputMessage || history[0].userInputMessage.userInputMessageContext?.toolResults)
+  ) {
+    history = history.slice(1)
+  }
+
+  const result: KiroHistoryEntry[] = []
+  for (let i = 0; i < history.length; i++) {
+    const entry = history[i]
+    if (!entry) continue
+
+    if (entry.assistantResponseMessage && !entry.assistantResponseMessage.toolUses && !entry.assistantResponseMessage.content) {
+      continue
+    }
+
+    if (entry.assistantResponseMessage?.toolUses) {
+      const next = history[i + 1]
+      if (next?.userInputMessage?.userInputMessageContext?.toolResults) result.push(entry)
+      continue
+    }
+
+    if (entry.userInputMessage?.userInputMessageContext?.toolResults) {
+      const previous = result[result.length - 1]
+      if (previous?.assistantResponseMessage?.toolUses) result.push(entry)
+      continue
+    }
+
+    result.push(entry)
+  }
+
+  return result
+}
+
+function extractToolNamesFromHistory(history: KiroHistoryEntry[]): Set<string> {
+  const names = new Set<string>()
+  for (const entry of history) {
+    for (const toolUse of entry.assistantResponseMessage?.toolUses ?? []) {
+      if (toolUse.name) names.add(toolUse.name)
+    }
+  }
+  return names
+}
+
+function addPlaceholderTools(tools: KiroToolSpec[] | undefined, history: KiroHistoryEntry[]): KiroToolSpec[] | undefined {
+  const historyToolNames = extractToolNamesFromHistory(history)
+  if (historyToolNames.size === 0) return tools
+
+  const existingTools = new Set((tools ?? []).map((tool) => tool.toolSpecification.name).filter(Boolean))
+  const missing = Array.from(historyToolNames).filter((name) => !existingTools.has(name))
+  if (missing.length === 0) return tools
+
+  return [
+    ...(tools ?? []),
+    ...missing.map((name) => ({
+      toolSpecification: {
+        name,
+        description: "Tool",
+        inputSchema: { json: { type: "object", properties: {} } },
+      },
+    })),
+  ]
+}
+
+function collectToolResults(messages: OpenAIChatMessage[]): KiroToolResult[] {
+  return messages.filter(isToolResultMessage).map((message) => ({
+    content: [{ text: truncate(sanitizeSurrogates(textFromContent(message.content)), TOOL_RESULT_LIMIT) }],
+    status: "success",
+    toolUseId: message.tool_call_id ?? "tool-call",
+  }))
+}
+
+function appendAssistantHistory(history: KiroHistoryEntry[], message: OpenAIChatMessage): void {
+  const entry = assistantEntry(message)
+  if (!entry?.assistantResponseMessage) return
+
+  const previous = history[history.length - 1]
+  if (previous?.assistantResponseMessage) {
+    previous.assistantResponseMessage.content += `${previous.assistantResponseMessage.content && entry.assistantResponseMessage.content ? "\n\n" : ""}${entry.assistantResponseMessage.content}`
+    if (entry.assistantResponseMessage.toolUses) {
+      previous.assistantResponseMessage.toolUses = [
+        ...(previous.assistantResponseMessage.toolUses ?? []),
+        ...entry.assistantResponseMessage.toolUses,
+      ]
+    }
+    return
+  }
+
+  history.push(entry)
+}
+
 export function buildKiroRequest(body: OpenAIChatRequest, conversationId: string, profileArn?: string): KiroRequest {
   const modelId = resolveKiroModel(body.model)
-  const tools = convertTools(body.tools)
-  const historyMessages = body.messages.slice(0, -1)
-  const current = body.messages[body.messages.length - 1]
+  const currentStartIndex = findCurrentMessageStartIndex(body.messages)
+  const historyMessages = body.messages.slice(0, currentStartIndex)
+  const currentMessages = body.messages.slice(currentStartIndex)
+  const firstCurrentMessage = currentMessages[0]
   const systemPrompt = body.messages
     .filter((message) => message.role === "system")
     .map((message) => sanitizeSurrogates(textFromContent(message.content)))
     .filter(Boolean)
     .join("\n\n")
-
-  const history = mergeHistoryEntries(
-    historyMessages.flatMap((message) => {
-      if (message.role === "system") return []
-      if (message.role === "assistant") {
-        const entry = assistantEntry(message)
-        return entry ? [entry] : []
-      }
-      if (message.role === "tool") return [toolResultEntry(message, modelId)]
-      if (message.role === "user") return [userEntry(message, modelId)]
-      return []
-    }),
-  )
-
-  if (systemPrompt && history[0]?.userInputMessage) {
-    history[0].userInputMessage.content = `${systemPrompt}\n\n${history[0].userInputMessage.content}`
-  }
-
-  if (current && isToolResultMessage(current)) {
-    const currentEntry = toolResultEntry(current, modelId)
-    const currentMessage = currentEntry.userInputMessage
-    if (!currentMessage) {
-      throw new Error("Tool result message could not be converted into a Kiro userInputMessage")
-    }
-    if (history.length === 0 && systemPrompt) {
-      currentMessage.content = `${systemPrompt}\n\n${currentMessage.content}`
-    }
-    return {
-      conversationState: {
-        chatTriggerType: "MANUAL",
-        agentTaskType: "vibe",
-        conversationId,
-        currentMessage: { userInputMessage: currentMessage },
-        ...(history.length > 0 ? { history } : {}),
-      },
-      ...(profileArn ? { profileArn } : {}),
-    }
-  }
-
-  const currentText = sanitizeSurrogates(current ? textFromContent(current.content) : "")
-  const currentImages = current ? imagesFromContent(current.content) : undefined
   const reasoningBudget =
     body.reasoning_effort === "max"
       ? 50_000
@@ -221,7 +299,51 @@ export function buildKiroRequest(body: OpenAIChatRequest, conversationId: string
             ? 10_000
             : 0
   const thinkingPrefix = reasoningBudget > 0 ? `<thinking_mode>enabled</thinking_mode><max_thinking_length>${reasoningBudget}</max_thinking_length>` : ""
-  const currentContent = [thinkingPrefix, history.length === 0 ? systemPrompt : "", currentText].filter(Boolean).join("\n\n")
+  const effectiveSystemPrompt = [thinkingPrefix, systemPrompt].filter(Boolean).join("\n")
+
+  let history = mergeHistoryEntries(
+    historyMessages.flatMap((message) => {
+      if (message.role === "system") return []
+      if (message.role === "assistant") {
+        const entry = assistantEntry(message)
+        return entry ? [entry] : []
+      }
+      if (message.role === "tool") return [toolResultEntry(message, modelId)]
+      if (message.role === "user") return [userEntry(message, modelId)]
+      return []
+    }),
+  )
+
+  let systemPrepended = false
+  if (effectiveSystemPrompt && history[0]?.userInputMessage) {
+    history[0].userInputMessage.content = `${effectiveSystemPrompt}\n\n${history[0].userInputMessage.content}`
+    systemPrepended = true
+  }
+
+  history = sanitizeHistory(stripHistoryImages(history))
+
+  let currentContent = ""
+  let currentImages = firstCurrentMessage ? imagesFromContent(firstCurrentMessage.content) : undefined
+  const currentToolResults = collectToolResults(currentMessages)
+
+  if (firstCurrentMessage && hasAssistantToolCalls(firstCurrentMessage)) {
+    appendAssistantHistory(history, firstCurrentMessage)
+    currentContent = currentToolResults.length > 0 ? "Tool results provided." : "Please proceed with the task."
+  } else if (firstCurrentMessage && isToolResultMessage(firstCurrentMessage)) {
+    currentContent = "Tool results provided."
+  } else {
+    const currentText = sanitizeSurrogates(firstCurrentMessage ? textFromContent(firstCurrentMessage.content) : "")
+    currentContent = [systemPrepended ? "" : effectiveSystemPrompt, currentText].filter(Boolean).join("\n\n")
+  }
+
+  const tools = addPlaceholderTools(convertTools(body.tools), history)
+  const userInputMessageContext =
+    currentToolResults.length > 0 || (tools && tools.length > 0)
+      ? {
+          ...(currentToolResults.length > 0 ? { toolResults: currentToolResults } : {}),
+          ...(tools && tools.length > 0 ? { tools } : {}),
+        }
+      : undefined
 
   return {
     conversationState: {
@@ -234,11 +356,12 @@ export function buildKiroRequest(body: OpenAIChatRequest, conversationId: string
           modelId,
           origin: "KIRO_CLI",
           ...(currentImages ? { images: currentImages } : {}),
-          ...(tools && tools.length > 0 ? { userInputMessageContext: { tools } } : {}),
+          ...(userInputMessageContext ? { userInputMessageContext } : {}),
         },
       },
       ...(history.length > 0 ? { history } : {}),
     },
     ...(profileArn ? { profileArn } : {}),
+    agentMode: "vibe",
   }
 }

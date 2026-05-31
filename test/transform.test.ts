@@ -28,7 +28,7 @@ describe("buildKiroRequest", () => {
     )
 
     expect(request.conversationState.history?.[0]?.userInputMessage?.content).toContain("Be concise")
-    expect(request.conversationState.currentMessage.userInputMessage.content).toContain("<thinking_mode>enabled</thinking_mode>")
+    expect(request.conversationState.history?.[0]?.userInputMessage?.content).toContain("<thinking_mode>enabled</thinking_mode>")
     expect(request.conversationState.currentMessage.userInputMessage.userInputMessageContext?.tools?.[0]?.toolSpecification.name).toBe("bash")
   })
 
@@ -72,5 +72,62 @@ describe("buildKiroRequest", () => {
     )
 
     expect(request.conversationState.currentMessage.userInputMessage.content).toContain("<max_thinking_length>50000</max_thinking_length>")
+  })
+
+  test("groups trailing tool results into the current Kiro message", () => {
+    const request = buildKiroRequest(
+      {
+        model: "claude-sonnet-4-6",
+        messages: [
+          { role: "user", content: "Start" },
+          {
+            role: "assistant",
+            content: "",
+            tool_calls: [
+              {
+                id: "tc1",
+                type: "function",
+                function: { name: "read", arguments: '{"path":"a"}' },
+              },
+              {
+                id: "tc2",
+                type: "function",
+                function: { name: "read", arguments: '{"path":"b"}' },
+              },
+            ],
+          },
+          { role: "tool", tool_call_id: "tc1", content: "one" },
+          { role: "tool", tool_call_id: "tc2", content: "two" },
+        ],
+      },
+      "conv-4",
+    )
+
+    expect(request.conversationState.currentMessage.userInputMessage.content).toBe("Tool results provided.")
+    expect(request.conversationState.currentMessage.userInputMessage.userInputMessageContext?.toolResults).toHaveLength(2)
+    expect(request.conversationState.history?.some((entry) => entry.userInputMessage?.userInputMessageContext?.toolResults)).toBe(false)
+    expect(request.agentMode).toBe("vibe")
+  })
+
+  test("converts responses-style function tools", () => {
+    const request = buildKiroRequest(
+      {
+        model: "claude-sonnet-4-6",
+        messages: [{ role: "user", content: "Use a tool" }],
+        tools: [
+          {
+            type: "function",
+            name: "list_files",
+            description: "List files",
+            parameters: { type: "object", properties: { path: { type: "string" } } },
+          },
+        ],
+      },
+      "conv-5",
+    )
+
+    const tool = request.conversationState.currentMessage.userInputMessage.userInputMessageContext?.tools?.[0]?.toolSpecification
+    expect(tool?.name).toBe("list_files")
+    expect(tool?.inputSchema.json).toEqual({ type: "object", properties: { path: { type: "string" } } })
   })
 })

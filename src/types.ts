@@ -53,19 +53,24 @@ export type OpenAIChatMessage = {
 export type OpenAIChatRequest = {
   model: string
   messages: OpenAIChatMessage[]
-  tools?: Array<{
-    type: "function"
-    function: {
-      name: string
-      description?: string
-      parameters?: Record<string, unknown>
-    }
-  }>
+  tools?: OpenAITool[]
   stream?: boolean
   max_tokens?: number
   max_completion_tokens?: number
   reasoning_effort?: string
   tool_choice?: "auto" | "required" | "none" | { type: string }
+}
+
+export type OpenAITool = {
+  type: "function"
+  function?: {
+    name: string
+    description?: string
+    parameters?: Record<string, unknown>
+  }
+  name?: string
+  description?: string
+  parameters?: Record<string, unknown>
 }
 
 type OpenAIResponseInputText = {
@@ -112,7 +117,7 @@ export type OpenAIResponsesRequest = {
   model: string
   input?: string | OpenAIResponseInputItem[]
   instructions?: string
-  tools?: OpenAIChatRequest["tools"]
+  tools?: OpenAITool[]
   stream?: boolean
   max_output_tokens?: number
   reasoning?: {

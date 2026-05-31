@@ -1,12 +1,15 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { OAUTH_DUMMY_KEY } from "./auth-constants.js"
 import { KIRO_PROVIDER_ID } from "./constants.js"
+import { getDebugLogFilePath, logDebug } from "./debug.js"
 import { getConfigModels, getBaseUrl } from "./models.js"
 import { authorizeKiro, parseStoredKiroOAuth, refreshKiroToken } from "./oauth.js"
 import { getSharedKiroCredentials } from "./storage.js"
 import { createKiroResponseFromRequest } from "./stream.js"
 
 const KiroAuthPlugin: Plugin = async ({ client }) => {
+  logDebug("plugin loaded", { provider: KIRO_PROVIDER_ID, logFile: getDebugLogFilePath() })
+
   async function ensureFreshAuth(getAuth: () => Promise<{ type: string; access?: string; refresh?: string; expires?: number }>) {
     const auth = await getAuth()
     if (auth.type !== "oauth" || !auth.access || !auth.refresh || typeof auth.expires !== "number") return undefined
